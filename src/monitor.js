@@ -5,6 +5,9 @@ import { EventEmitter } from 'events';
 import chokidar from 'chokidar';
 
 const CLAUDE_SESSIONS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const SESSIONS_GLOB = process.platform === 'win32'
+  ? path.join(CLAUDE_SESSIONS_DIR, '**', '*.jsonl').replace(/\\/g, '/')
+  : `${CLAUDE_SESSIONS_DIR}/**/*.jsonl`;
 const CLAUDE_STATS_FILE = path.join(os.homedir(), '.claude', 'statsig.json');
 
 // Thresholds based on real data from AMD director's analysis
@@ -106,8 +109,12 @@ export class PulseMonitor extends EventEmitter {
       return;
     }
 
+    // Prime metrics from existing session files so we don't fall back to
+    // simulation while real data is already present on disk.
+    this._processMostRecentSessionFile();
+
     try {
-      this.watcher = chokidar.watch(`${CLAUDE_SESSIONS_DIR}/**/*.jsonl`, {
+      this.watcher = chokidar.watch(SESSIONS_GLOB, {
         persistent: true,
         ignoreInitial: false,
         usePolling: true,
@@ -116,9 +123,12 @@ export class PulseMonitor extends EventEmitter {
 
       this._watchBootstrapTimer = setTimeout(() => {
         if (!this.activeSession) {
-          if (this.watcher) this.watcher.close();
-          this.watcher = null;
-          this._startSimulation();
+          // Only simulate if no real session files currently exist.
+          if (!this._hasSessionJsonl(CLAUDE_SESSIONS_DIR)) {
+            if (this.watcher) this.watcher.close();
+            this.watcher = null;
+            this._startSimulation();
+          }
         }
       }, 1500);
 
@@ -127,7 +137,7 @@ export class PulseMonitor extends EventEmitter {
           clearTimeout(this._watchBootstrapTimer);
           this._watchBootstrapTimer = null;
         }
-        this._processSessionFile(filePath);
+        this._processMostRecentSessionFile(filePath);
       });
 
       this.watcher.on('add', (filePath) => {
@@ -135,7 +145,7 @@ export class PulseMonitor extends EventEmitter {
           clearTimeout(this._watchBootstrapTimer);
           this._watchBootstrapTimer = null;
         }
-        this._processSessionFile(filePath);
+        this._processMostRecentSessionFile(filePath);
       });
 
       this.watcher.on('error', () => {
@@ -164,6 +174,53 @@ export class PulseMonitor extends EventEmitter {
     } catch {
       return false;
     }
+  }
+
+  _listSessionJsonl(dirPath) {
+    const files = [];
+    try {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+          files.push(fullPath);
+        }
+        if (entry.isDirectory()) {
+          files.push(...this._listSessionJsonl(fullPath));
+        }
+      }
+    } catch {
+      return files;
+    }
+
+    // Sort newest to oldest so active sessions are processed first.
+    return files.sort((a, b) => {
+      try {
+        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
+  }
+
+  _processMostRecentSessionFile(preferredFilePath = null) {
+    const candidates = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
+    if (preferredFilePath && fs.existsSync(preferredFilePath)) {
+      candidates.unshift(preferredFilePath);
+    }
+
+    const unique = [...new Set(candidates)];
+    if (unique.length === 0) return;
+
+    const newest = unique.sort((a, b) => {
+      try {
+        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+      } catch {
+        return 0;
+      }
+    })[0];
+
+    this._processSessionFile(newest);
   }
 
   _processSessionFile(filePath) {
