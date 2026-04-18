@@ -11,8 +11,6 @@ npm install -g @rafidr00/pulse
 pulse
 ```
 
----
-
 ## What it monitors
 
 ```
@@ -27,26 +25,9 @@ pulse
 | **Quota burn rate** | Live %/hr burn with estimated time remaining |
 | **Budget mode** | Automatically switches to Sonnet + low effort when quota drops below 25% |
 
----
-
 ## Terminal UI
 
-```
-  pulse▸  ● HEALTHY  claude-code
-
-  THINKING          CONTEXT           QUOTA             BURN RATE
-  DEEP              WARMING           71%               9%/hr
-  ████████████████  ████░░░░░░░░░░░░  ██████████░░░░░░  ▸ 7.8h left
-
-┌─ ◈ THINKING DEPTH ──┐  ┌─ ◈ CONTEXT WINDOW ──┐
-│                      │  │                      │
-│  depth    ~2100 chars│  │  window   18% used   │
-│  level    DEEP       │  │  tokens   36K / 200K │
-│  score    ████████░░ │  │  ████░░░░░░░░░░░░░░  │
-│  trend    → stable   │  │  health   warming    │
-│                      │  │                      │
-└──────────────────────┘  └──────────────────────┘
-```
+The dashboard runs entirely in your terminal alongside Claude Code. No browser, no setup, no data leaves your machine.
 
 ## Why this exists
 
@@ -55,8 +36,6 @@ In February 2026, Anthropic silently reduced Claude's default thinking depth by 
 Separately, a bug in Claude Code's autocompact feature caused up to 3,272 consecutive failures in a single session — burning $200/month quotas in 19 minutes. The fix was 3 lines of code. It ran for weeks.
 
 `pulse` is the monitoring layer that should have existed from day one.
-
----
 
 ## Install
 
@@ -72,16 +51,9 @@ pulse
 
 ## Budget mode
 
-When quota drops below 25%, pulse automatically activates budget mode:
-
-```
-⚡ BUDGET MODE ACTIVE — quota at 23%
-suggested: /model claude-sonnet-4-6  ·  /effort low  ·  /compact
-```
+When quota drops below 25% pulse activates budget mode automatically — switches model, reduces effort, compresses context.
 
 Toggle manually with `[b]` in the terminal dashboard.
-
----
 
 ## How it works
 
@@ -91,12 +63,8 @@ Pulse hooks into Claude Code's session JSONL files at `~/.claude/projects/` and 
 
 **Context health** uses the real degradation thresholds discovered from user reports: quality issues start at ~20% usage, not the 100% Anthropic advertises.
 
----
-
 ## Stack
 
-Node.js · blessed · chalk · chokidar
+Node.js  blessed  chalk  chokidar
 
----
-
-Built by [@RafiDr00](https://github.com/RafiDr00) · MIT License
+Built by @RafiDr00  MIT License
