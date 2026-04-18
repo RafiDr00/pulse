@@ -44,6 +44,7 @@ export class PulseMonitor extends EventEmitter {
     this._pendingPreferredFile = null;
     this._lastWatchEventAt = 0;
     this._lastRealActivityAt = 0;
+    this._lastProcessedSessionPath = null;
   }
 
   _freshMetrics() {
@@ -180,15 +181,13 @@ export class PulseMonitor extends EventEmitter {
       if (!this._sessionPollInterval) {
         this._sessionPollInterval = setInterval(() => {
           void (async () => {
-            if (Date.now() - this._lastWatchEventAt < 5000) return;
+            const hasRecent = await this._processMostRecentSessionFile();
             if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
               this._forceRealMode();
-              return;
             }
-            const hasRecent = await this._processMostRecentSessionFile();
             if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
           })();
-        }, 1200);
+        }, 500);
       }
     } catch {
       this._startSimulation();
@@ -300,18 +299,20 @@ export class PulseMonitor extends EventEmitter {
     }
 
     const candidates = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
-    if (preferredFilePath && fs.existsSync(preferredFilePath)) {
-      candidates.unshift(preferredFilePath);
+    const newest = candidates[0] || null;
+    if (!newest) {
+      if (this._hasRecentRealActivity()) return true;
+      return false;
     }
 
-    const unique = [...new Set(candidates)];
-    if (unique.length === 0) return false;
-
-    for (const candidate of unique) {
-      if (await this._isRecentSession(candidate)) {
-        return this._processSessionFile(candidate);
-      }
+    if (this._lastProcessedSessionPath !== newest) {
+      this._lastProcessedSessionPath = newest;
     }
+
+    if (await this._isRecentSession(newest)) {
+      return this._processSessionFile(newest);
+    }
+
     if (this._hasRecentRealActivity()) return true;
     return false;
   }
@@ -469,6 +470,7 @@ export class PulseMonitor extends EventEmitter {
     this.metrics = { ...this.metrics, ...metrics };
     this.activeSession = filePath;
     this._lastRealActivityAt = Date.now();
+    this._lastProcessedSessionPath = filePath;
 
     this._checkBudgetMode();
     this.emit('update', this.metrics);
