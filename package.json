@@ -1,5 +1,6 @@
 {
-  "name": "@rafidr00/pulse",
+  "name": "pulse",
+  "version": "1.0.0",
   "description": "Real-time session health monitor for Claude Code",
   "type": "module",
   "main": "index.js",
