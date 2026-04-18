@@ -2,15 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { EventEmitter } from 'events';
-import chokidar from 'chokidar';
 
 const CLAUDE_SESSIONS_DIR = path.join(os.homedir(), '.claude', 'projects');
-const SESSIONS_GLOB = process.platform === 'win32'
-  ? path.join(CLAUDE_SESSIONS_DIR, '**', '*.jsonl').replace(/\\/g, '/')
-  : `${CLAUDE_SESSIONS_DIR}/**/*.jsonl`;
 const CLAUDE_STATS_FILE = path.join(os.homedir(), '.claude', 'statsig.json');
 const REAL_SESSION_FORCE_RECENT_MS = 10 * 60 * 1000;
 const REAL_SESSION_GRACE_MS = 30 * 60 * 1000;
+const SUBAGENTS_SEGMENT = `${path.sep}subagents${path.sep}`;
 
 // Thresholds based on real data from AMD director's analysis
 const THRESHOLDS = {
@@ -42,9 +39,10 @@ export class PulseMonitor extends EventEmitter {
     this._budgetEmitted = false;
     this._watchDebounceTimer = null;
     this._pendingPreferredFile = null;
-    this._lastWatchEventAt = 0;
     this._lastRealActivityAt = 0;
     this._lastProcessedSessionPath = null;
+    this._lastProcessedSessionMtimeMs = 0;
+    this._activeSessionBirthMs = 0;
   }
 
   _freshMetrics() {
@@ -121,7 +119,7 @@ export class PulseMonitor extends EventEmitter {
   }
 
   _watchSessions() {
-    // Watch for new/modified JSONL session files
+    // Windows + OneDrive is more reliable with direct mtime polling than chokidar.
     if (!fs.existsSync(CLAUDE_SESSIONS_DIR)) {
       this._startSimulation();
       return;
@@ -131,80 +129,21 @@ export class PulseMonitor extends EventEmitter {
       this._forceRealMode();
     }
 
-    // Prefer real sessions only when they are active/recent.
     void this._processMostRecentSessionFile().then((hasRecent) => {
       if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
     });
 
-    try {
-      this.watcher = chokidar.watch(SESSIONS_GLOB, {
-        persistent: true,
-        ignoreInitial: false,
-        usePolling: true,
-        interval: 1000,
-      });
-
-      this._watchBootstrapTimer = setTimeout(() => {
-        if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
-          this._forceRealMode();
-          return;
-        }
-        void this._processMostRecentSessionFile().then((hasRecent) => {
+    if (!this._sessionPollInterval) {
+      this._sessionPollInterval = setInterval(() => {
+        void (async () => {
+          const hasRecent = await this._processMostRecentSessionFile();
+          if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
+            this._forceRealMode();
+          }
           if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
-        });
-      }, 1500);
-
-      const onWatchEvent = (filePath) => {
-        this._lastWatchEventAt = Date.now();
-        if (this._watchBootstrapTimer) {
-          clearTimeout(this._watchBootstrapTimer);
-          this._watchBootstrapTimer = null;
-        }
-        this._debouncedProcessMostRecentSessionFile(filePath);
-      };
-
-      this.watcher.on('change', onWatchEvent);
-      this.watcher.on('add', onWatchEvent);
-
-      this.watcher.on('error', () => {
-        if (this.watcher) this.watcher.close();
-        this.watcher = null;
-        if (this._sessionPollInterval) {
-          clearInterval(this._sessionPollInterval);
-          this._sessionPollInterval = null;
-        }
-        this._startSimulation();
-      });
-
-      // Reliability fallback for Windows/OneDrive: periodically scan newest
-      // session file even if watcher events are dropped.
-      if (!this._sessionPollInterval) {
-        this._sessionPollInterval = setInterval(() => {
-          void (async () => {
-            const hasRecent = await this._processMostRecentSessionFile();
-            if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
-              this._forceRealMode();
-            }
-            if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
-          })();
-        }, 500);
-      }
-    } catch {
-      this._startSimulation();
+        })();
+      }, 500);
     }
-  }
-
-  _debouncedProcessMostRecentSessionFile(preferredFilePath = null) {
-    if (preferredFilePath) this._pendingPreferredFile = preferredFilePath;
-    if (this._watchDebounceTimer) {
-      clearTimeout(this._watchDebounceTimer);
-    }
-    this._watchDebounceTimer = setTimeout(() => {
-      const pathHint = this._pendingPreferredFile;
-      this._pendingPreferredFile = null;
-      this._watchDebounceTimer = null;
-      void this._processMostRecentSessionFile(pathHint);
-    }, 350);
   }
 
   _listSessionJsonl(dirPath, visited = new Set(), depth = 0, maxDepth = 24) {
@@ -244,7 +183,14 @@ export class PulseMonitor extends EventEmitter {
     }).filter(Boolean);
 
     // Sort newest to oldest so active sessions are processed first.
-    return withMtime.sort((a, b) => b.mtime - a.mtime).map((entry) => entry.file);
+    return withMtime
+      .sort((a, b) => {
+        if (b.mtime !== a.mtime) return b.mtime - a.mtime;
+        const aIsSub = a.file.includes(SUBAGENTS_SEGMENT) ? 1 : 0;
+        const bIsSub = b.file.includes(SUBAGENTS_SEGMENT) ? 1 : 0;
+        return aIsSub - bIsSub;
+      })
+      .map((entry) => entry.file);
   }
 
   _hasRecentJsonlActivity(maxAgeMs) {
@@ -279,8 +225,40 @@ export class PulseMonitor extends EventEmitter {
     }
   }
 
+  _updateDurationFromBirthMs(birthMs) {
+    if (!Number.isFinite(birthMs) || birthMs <= 0) return;
+    const durationSec = Math.max(0, Math.floor((Date.now() - birthMs) / 1000));
+    this.metrics = {
+      ...this.metrics,
+      session: {
+        ...this.metrics.session,
+        duration: durationSec,
+      },
+    };
+  }
+
   _hasRecentRealActivity() {
     return this._lastRealActivityAt > 0 && (Date.now() - this._lastRealActivityAt) <= REAL_SESSION_GRACE_MS;
+  }
+
+  async _selectActiveSessionCandidate(candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return null;
+
+    // Prefer the main session file over subagent sidecar files.
+    for (const candidate of candidates) {
+      if (!candidate.includes(SUBAGENTS_SEGMENT) && await this._isRecentSession(candidate)) {
+        return candidate;
+      }
+    }
+
+    // Fall back to any recent file when only subagent files are active.
+    for (const candidate of candidates) {
+      if (await this._isRecentSession(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
   }
 
   async _isRecentSession(filePath, maxAgeMs = REAL_SESSION_GRACE_MS) {
@@ -293,31 +271,48 @@ export class PulseMonitor extends EventEmitter {
     }
   }
 
-  async _processMostRecentSessionFile(preferredFilePath = null) {
+  async _processMostRecentSessionFile() {
     if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
       this._forceRealMode();
     }
 
     const candidates = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
-    const newest = candidates[0] || null;
+    const newest = await this._selectActiveSessionCandidate(candidates);
     if (!newest) {
       if (this._hasRecentRealActivity()) return true;
       return false;
     }
 
-    if (this._lastProcessedSessionPath !== newest) {
+    let stats;
+    try {
+      stats = await fs.promises.stat(newest);
+    } catch {
+      return this._hasRecentRealActivity();
+    }
+
+    const pathChanged = this._lastProcessedSessionPath !== newest;
+    const mtimeChanged = this._lastProcessedSessionMtimeMs !== stats.mtimeMs;
+
+    if (pathChanged) {
       this._lastProcessedSessionPath = newest;
+      this._lastProcessedSessionMtimeMs = stats.mtimeMs;
+      this._activeSessionBirthMs = stats.birthtimeMs || stats.ctimeMs || Date.now();
+      return this._processSessionFile(newest, stats);
     }
 
-    if (await this._isRecentSession(newest)) {
-      return this._processSessionFile(newest);
+    if (mtimeChanged && await this._isRecentSession(newest)) {
+      this._lastProcessedSessionMtimeMs = stats.mtimeMs;
+      return this._processSessionFile(newest, stats);
     }
 
+    // No new writes yet; keep duration live from file creation time.
+    this._updateDurationFromBirthMs(this._activeSessionBirthMs);
+    this.emit('update', this.metrics);
     if (this._hasRecentRealActivity()) return true;
     return false;
   }
 
-  async _processSessionFile(filePath) {
+  async _processSessionFile(filePath, fileStats = null) {
     try {
       const content = await fs.promises.readFile(filePath, 'utf8');
       const lines = content.trim().split('\n').filter(Boolean);
@@ -327,7 +322,7 @@ export class PulseMonitor extends EventEmitter {
         try { return JSON.parse(l); } catch { return null; }
       }).filter(Boolean);
 
-      this._analyzeSession(entries, filePath);
+      this._analyzeSession(entries, filePath, fileStats);
       return true;
     } catch {
       // File still being written
@@ -335,25 +330,39 @@ export class PulseMonitor extends EventEmitter {
     }
   }
 
-  _analyzeSession(entries, filePath) {
+  _analyzeSession(entries, filePath, fileStats = null) {
     const metrics = this._freshMetrics();
     metrics.status = 'healthy';
     metrics.version = this._extractVersionFromEntries(entries) || this.metrics.version || null;
     metrics.quota = { ...this.metrics.quota };
+    const birthMs = fileStats?.birthtimeMs || this._activeSessionBirthMs || Date.now();
+    metrics.session.duration = Math.max(0, Math.floor((Date.now() - birthMs) / 1000));
 
     // --- Thinking depth analysis ---
-    const thinkingBlocks = entries.filter(e =>
-      e.type === 'thinking' || e.thinking_content || e.signature
-    );
+    const thinkingBlocks = [];
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (entry.type === 'thinking' || entry.thinking_content || entry.signature || entry.thinking) {
+        thinkingBlocks.push(entry);
+      }
+      const blocks = entry.message?.content;
+      if (Array.isArray(blocks)) {
+        for (const block of blocks) {
+          if (block?.type === 'thinking' || block?.thinking || block?.thinking_content || block?.signature) {
+            thinkingBlocks.push(block);
+          }
+        }
+      }
+    }
 
-    const visibleThinking = thinkingBlocks.filter(e => e.thinking_content);
-    const redactedThinking = thinkingBlocks.filter(e => e.signature && !e.thinking_content);
+    const visibleThinking = thinkingBlocks.filter(e => (e.thinking_content || e.thinking));
+    const redactedThinking = thinkingBlocks.filter(e => e.signature && !(e.thinking_content || e.thinking));
 
     metrics.thinking.redacted = redactedThinking.length > visibleThinking.length;
 
     if (visibleThinking.length > 0) {
       const avgLen = visibleThinking.reduce((s, e) =>
-        s + (e.thinking_content?.length || 0), 0) / visibleThinking.length;
+        s + ((e.thinking_content || e.thinking || '').length || 0), 0) / visibleThinking.length;
       metrics.thinking.depth = Math.round(avgLen);
     } else if (redactedThinking.length > 0) {
       // Estimate from signature correlation (0.971 Pearson per AMD analysis)
@@ -379,12 +388,16 @@ export class PulseMonitor extends EventEmitter {
     const toolCalls = this._extractToolCalls(entries);
     metrics.session.toolCalls = toolCalls.length;
 
-    const reads = toolCalls.filter((e) =>
-      ['read_file', 'view', 'Read'].includes(e.name)
-    ).length;
-    const edits = toolCalls.filter((e) =>
-      ['write_file', 'edit_file', 'str_replace_based_edit_tool', 'Write', 'Edit'].includes(e.name)
-    ).length;
+    const reads = toolCalls.filter((e) => {
+      const name = String(e.name || '').toLowerCase();
+      return ['read_file', 'view', 'read'].includes(name) || name.includes('read');
+    }).length;
+    const edits = toolCalls.filter((e) => {
+      const name = String(e.name || '').toLowerCase();
+      return ['write_file', 'edit_file', 'str_replace_based_edit_tool', 'write', 'edit', 'multiedit'].includes(name)
+        || name.includes('edit')
+        || name.includes('write');
+    }).length;
 
     metrics.session.readEditRatio = edits > 0 ? (reads / edits).toFixed(1) : '∞';
 

@@ -65,6 +65,6 @@ Pulse hooks into Claude Code's session JSONL files at `~/.claude/projects/` and 
 
 ## Stack
 
-Node.js  blessed  chalk  chokidar
+Node.js  blessed  chalk
 
 Built by @RafiDr00  MIT License
