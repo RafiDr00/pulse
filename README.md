@@ -48,12 +48,6 @@ pulse
 └──────────────────────┘  └──────────────────────┘
 ```
 
-## Web UI
-
-Open `http://localhost:4242` for the full dashboard with sparklines, live event feed, and budget mode controls.
-
----
-
 ## Why this exists
 
 In February 2026, Anthropic silently reduced Claude's default thinking depth by 73%. A senior AMD director had to analyze 6,852 session files and 234,760 tool calls to prove it. Developers were losing hours of productive work with no explanation.
@@ -73,10 +67,7 @@ npm install -g @rafidr00/pulse
 ## Usage
 
 ```bash
-pulse              # terminal UI + web dashboard
-pulse --term       # terminal only
-pulse --web        # web only (http://localhost:4242)
-pulse --port=8080  # custom port
+pulse
 ```
 
 ## Budget mode
@@ -88,7 +79,7 @@ When quota drops below 25%, pulse automatically activates budget mode:
 suggested: /model claude-sonnet-4-6  ·  /effort low  ·  /compact
 ```
 
-Toggle manually with `[b]` in the terminal UI.
+Toggle manually with `[b]` in the terminal dashboard.
 
 ---
 
@@ -104,7 +95,7 @@ Pulse hooks into Claude Code's session JSONL files at `~/.claude/projects/` and 
 
 ## Stack
 
-Node.js · blessed · chalk · chokidar · express · ws
+Node.js · blessed · chalk · chokidar
 
 ---
 
