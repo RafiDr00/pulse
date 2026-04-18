@@ -9,6 +9,8 @@ const SESSIONS_GLOB = process.platform === 'win32'
   ? path.join(CLAUDE_SESSIONS_DIR, '**', '*.jsonl').replace(/\\/g, '/')
   : `${CLAUDE_SESSIONS_DIR}/**/*.jsonl`;
 const CLAUDE_STATS_FILE = path.join(os.homedir(), '.claude', 'statsig.json');
+const REAL_SESSION_FORCE_RECENT_MS = 10 * 60 * 1000;
+const REAL_SESSION_GRACE_MS = 30 * 60 * 1000;
 
 // Thresholds based on real data from AMD director's analysis
 const THRESHOLDS = {
@@ -41,6 +43,7 @@ export class PulseMonitor extends EventEmitter {
     this._watchDebounceTimer = null;
     this._pendingPreferredFile = null;
     this._lastWatchEventAt = 0;
+    this._lastRealActivityAt = 0;
   }
 
   _freshMetrics() {
@@ -123,9 +126,13 @@ export class PulseMonitor extends EventEmitter {
       return;
     }
 
+    if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
+      this._forceRealMode();
+    }
+
     // Prefer real sessions only when they are active/recent.
     void this._processMostRecentSessionFile().then((hasRecent) => {
-      if (!hasRecent) this._startSimulation();
+      if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
     });
 
     try {
@@ -137,8 +144,12 @@ export class PulseMonitor extends EventEmitter {
       });
 
       this._watchBootstrapTimer = setTimeout(() => {
+        if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
+          this._forceRealMode();
+          return;
+        }
         void this._processMostRecentSessionFile().then((hasRecent) => {
-          if (!hasRecent) this._startSimulation();
+          if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
         });
       }, 1500);
 
@@ -170,8 +181,12 @@ export class PulseMonitor extends EventEmitter {
         this._sessionPollInterval = setInterval(() => {
           void (async () => {
             if (Date.now() - this._lastWatchEventAt < 5000) return;
+            if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
+              this._forceRealMode();
+              return;
+            }
             const hasRecent = await this._processMostRecentSessionFile();
-            if (!hasRecent) this._startSimulation();
+            if (!hasRecent && !this._hasRecentRealActivity()) this._startSimulation();
           })();
         }, 1200);
       }
@@ -233,7 +248,43 @@ export class PulseMonitor extends EventEmitter {
     return withMtime.sort((a, b) => b.mtime - a.mtime).map((entry) => entry.file);
   }
 
-  async _isRecentSession(filePath, maxAgeMs = 90000) {
+  _hasRecentJsonlActivity(maxAgeMs) {
+    const now = Date.now();
+    const files = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
+    for (const file of files) {
+      try {
+        const mtimeMs = fs.statSync(file).mtimeMs;
+        if (now - mtimeMs < maxAgeMs) {
+          return true;
+        }
+      } catch {
+        // ignore inaccessible files
+      }
+    }
+    return false;
+  }
+
+  _forceRealMode() {
+    this._lastRealActivityAt = Date.now();
+    if (this._simInterval) {
+      clearInterval(this._simInterval);
+      this._simInterval = null;
+    }
+    if (this.metrics._simulated !== false) {
+      this.metrics = {
+        ...this.metrics,
+        _simulated: false,
+        lastUpdated: Date.now(),
+      };
+      this.emit('update', this.metrics);
+    }
+  }
+
+  _hasRecentRealActivity() {
+    return this._lastRealActivityAt > 0 && (Date.now() - this._lastRealActivityAt) <= REAL_SESSION_GRACE_MS;
+  }
+
+  async _isRecentSession(filePath, maxAgeMs = REAL_SESSION_GRACE_MS) {
     try {
       const stats = await fs.promises.stat(filePath);
       const ageMs = Date.now() - stats.mtimeMs;
@@ -244,6 +295,10 @@ export class PulseMonitor extends EventEmitter {
   }
 
   async _processMostRecentSessionFile(preferredFilePath = null) {
+    if (this._hasRecentJsonlActivity(REAL_SESSION_FORCE_RECENT_MS)) {
+      this._forceRealMode();
+    }
+
     const candidates = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
     if (preferredFilePath && fs.existsSync(preferredFilePath)) {
       candidates.unshift(preferredFilePath);
@@ -257,6 +312,7 @@ export class PulseMonitor extends EventEmitter {
         return this._processSessionFile(candidate);
       }
     }
+    if (this._hasRecentRealActivity()) return true;
     return false;
   }
 
@@ -412,6 +468,7 @@ export class PulseMonitor extends EventEmitter {
 
     this.metrics = { ...this.metrics, ...metrics };
     this.activeSession = filePath;
+    this._lastRealActivityAt = Date.now();
 
     this._checkBudgetMode();
     this.emit('update', this.metrics);

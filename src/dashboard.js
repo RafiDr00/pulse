@@ -148,8 +148,7 @@ export class TerminalDashboard {
       thinkingLevel: null,
       contextHealth: null,
       budgetMode: false,
-      loopAboveThreshold: null,
-      loopTriggered: false,
+      loops: false,
     };
     this.events = [];
     this.clock = this._timeString();
@@ -365,14 +364,13 @@ export class TerminalDashboard {
     this._lastEvents.thinkingLevel = metrics.thinking.level;
 
     const loopAboveThreshold = metrics.session.loops >= 3;
-    if (loopAboveThreshold && !this._lastEvents.loopTriggered) {
+    if (loopAboveThreshold && !this._lastEvents.loops) {
       this._pushEvent(C.red, `⚠ loop detected — ${metrics.session.loops} failures`);
-      this._lastEvents.loopTriggered = true;
+      this._lastEvents.loops = true;
     }
-    if (!loopAboveThreshold) {
-      this._lastEvents.loopTriggered = false;
+    if (!loopAboveThreshold && this._lastEvents.loops) {
+      this._lastEvents.loops = false;
     }
-    this._lastEvents.loopAboveThreshold = loopAboveThreshold;
 
     if (this._lastEvents.contextHealth !== null && this._lastEvents.contextHealth !== metrics.context.health) {
       this._pushEvent(
