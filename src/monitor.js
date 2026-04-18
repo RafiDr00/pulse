@@ -34,6 +34,7 @@ export class PulseMonitor extends EventEmitter {
     this.budgetMode = false;
     this._tokenHistory = []; // [{time, tokens}] for burn rate
     this._watchBootstrapTimer = null;
+    this._sessionPollInterval = null;
   }
 
   _freshMetrics() {
@@ -92,6 +93,10 @@ export class PulseMonitor extends EventEmitter {
     if (this._simInterval) {
       clearInterval(this._simInterval);
       this._simInterval = null;
+    }
+    if (this._sessionPollInterval) {
+      clearInterval(this._sessionPollInterval);
+      this._sessionPollInterval = null;
     }
     if (this.watcher) this.watcher.close();
     this.emit('stopped');
@@ -153,6 +158,14 @@ export class PulseMonitor extends EventEmitter {
         this.watcher = null;
         this._startSimulation();
       });
+
+      // Reliability fallback for Windows/OneDrive: periodically scan newest
+      // session file even if watcher events are dropped.
+      if (!this._sessionPollInterval) {
+        this._sessionPollInterval = setInterval(() => {
+          this._processMostRecentSessionFile();
+        }, 1200);
+      }
     } catch {
       this._startSimulation();
     }
@@ -503,6 +516,11 @@ export class PulseMonitor extends EventEmitter {
   _startSimulation() {
     if (this._simInterval) {
       return;
+    }
+
+    if (this._sessionPollInterval) {
+      clearInterval(this._sessionPollInterval);
+      this._sessionPollInterval = null;
     }
 
     if (this._watchBootstrapTimer) {
