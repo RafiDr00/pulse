@@ -339,6 +339,7 @@ export class PulseMonitor extends EventEmitter {
     const metrics = this._freshMetrics();
     metrics.status = 'healthy';
     metrics.version = this._extractVersionFromEntries(entries) || this.metrics.version || null;
+    metrics.quota = { ...this.metrics.quota };
 
     // --- Thinking depth analysis ---
     const thinkingBlocks = entries.filter(e =>
@@ -467,7 +468,14 @@ export class PulseMonitor extends EventEmitter {
       this._simInterval = null;
     }
 
-    this.metrics = { ...this.metrics, ...metrics };
+    this.metrics = {
+      ...this.metrics,
+      ...metrics,
+      thinking: { ...this.metrics.thinking, ...metrics.thinking },
+      context: { ...this.metrics.context, ...metrics.context },
+      quota: { ...this.metrics.quota, ...metrics.quota },
+      session: { ...this.metrics.session, ...metrics.session },
+    };
     this.activeSession = filePath;
     this._lastRealActivityAt = Date.now();
     this._lastProcessedSessionPath = filePath;
@@ -478,6 +486,19 @@ export class PulseMonitor extends EventEmitter {
 
   _extractToolCalls(entries) {
     const calls = [];
+    const byUseId = new Map();
+
+    const updateCallErrorById = (toolUseId, isError) => {
+      const idx = byUseId.get(toolUseId);
+      if (idx === undefined) return;
+      calls[idx].isError = Boolean(isError);
+    };
+
+    const extractBlocks = (node) => {
+      if (!node || typeof node !== 'object') return [];
+      const content = node.message?.content;
+      return Array.isArray(content) ? content : [];
+    };
 
     for (const entry of entries) {
       if (!entry || typeof entry !== 'object') continue;
@@ -490,16 +511,26 @@ export class PulseMonitor extends EventEmitter {
         });
       }
 
+      if (entry.type === 'tool_result' && entry.tool_use_id) {
+        updateCallErrorById(entry.tool_use_id, entry.is_error || entry.error);
+      }
+
       // Current Claude Code shape: assistant message content blocks.
-      const content = entry.message?.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block?.type === 'tool_use' && block?.name) {
-            calls.push({
-              name: block.name,
-              isError: false,
-            });
+      const blocks = extractBlocks(entry);
+      for (const block of blocks) {
+        if (block?.type === 'tool_use' && block?.name) {
+          const idx = calls.length;
+          calls.push({
+            name: block.name,
+            isError: false,
+          });
+          if (block.id) {
+            byUseId.set(block.id, idx);
           }
+        }
+
+        if (block?.type === 'tool_result' && block?.tool_use_id) {
+          updateCallErrorById(block.tool_use_id, block.is_error || block.error);
         }
       }
     }

@@ -32,3 +32,48 @@ test('extractVersionFromEntries finds semver in nested payloads', () => {
   const version = monitor._extractVersionFromEntries(entries);
   assert.equal(version, '2.3.4');
 });
+
+test('extractToolCalls maps tool_result error to matching tool_use', () => {
+  const monitor = new PulseMonitor();
+  const entries = [
+    {
+      message: {
+        content: [
+          { type: 'tool_use', id: 'toolu_1', name: 'read_file' },
+          { type: 'tool_result', tool_use_id: 'toolu_1', is_error: true },
+        ],
+      },
+    },
+  ];
+
+  const calls = monitor._extractToolCalls(entries);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], { name: 'read_file', isError: true });
+});
+
+test('analyzeSession preserves quota values from stats polling', () => {
+  const monitor = new PulseMonitor();
+  monitor.metrics.quota.remaining = 37;
+  monitor.metrics.quota.used = 63;
+  monitor.metrics.quota.burnRate = 12;
+  monitor.metrics.quota.estimatedHoursLeft = 3.1;
+
+  const entries = [
+    { role: 'user', content: 'check' },
+    {
+      message: {
+        content: [
+          { type: 'tool_use', id: 'toolu_2', name: 'read_file' },
+          { type: 'tool_result', tool_use_id: 'toolu_2', is_error: false },
+        ],
+      },
+    },
+  ];
+
+  monitor._analyzeSession(entries, 'session.jsonl');
+
+  assert.equal(monitor.metrics.quota.remaining, 37);
+  assert.equal(monitor.metrics.quota.used, 63);
+  assert.equal(monitor.metrics.quota.burnRate, 12);
+  assert.equal(monitor.metrics.quota.estimatedHoursLeft, 3.1);
+});
