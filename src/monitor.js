@@ -36,6 +36,11 @@ export class PulseMonitor extends EventEmitter {
     this._watchBootstrapTimer = null;
     this._sessionPollInterval = null;
     this._quotaPollInterval = null;
+    this._simInterval = null;
+    this._budgetEmitted = false;
+    this._watchDebounceTimer = null;
+    this._pendingPreferredFile = null;
+    this._lastWatchEventAt = 0;
   }
 
   _freshMetrics() {
@@ -103,6 +108,10 @@ export class PulseMonitor extends EventEmitter {
       clearInterval(this._quotaPollInterval);
       this._quotaPollInterval = null;
     }
+    if (this._watchDebounceTimer) {
+      clearTimeout(this._watchDebounceTimer);
+      this._watchDebounceTimer = null;
+    }
     if (this.watcher) this.watcher.close();
     this.emit('stopped');
   }
@@ -115,9 +124,9 @@ export class PulseMonitor extends EventEmitter {
     }
 
     // Prefer real sessions only when they are active/recent.
-    if (!this._processMostRecentSessionFile()) {
-      this._startSimulation();
-    }
+    void this._processMostRecentSessionFile().then((hasRecent) => {
+      if (!hasRecent) this._startSimulation();
+    });
 
     try {
       this.watcher = chokidar.watch(SESSIONS_GLOB, {
@@ -128,36 +137,30 @@ export class PulseMonitor extends EventEmitter {
       });
 
       this._watchBootstrapTimer = setTimeout(() => {
-        if (!this.activeSession) {
-          // Simulate when no recent real activity is detected.
-          if (!this._processMostRecentSessionFile()) {
-            if (this.watcher) this.watcher.close();
-            this.watcher = null;
-            this._startSimulation();
-            this._watchSessions();
-          }
-        }
+        void this._processMostRecentSessionFile().then((hasRecent) => {
+          if (!hasRecent) this._startSimulation();
+        });
       }, 1500);
 
-      this.watcher.on('change', (filePath) => {
+      const onWatchEvent = (filePath) => {
+        this._lastWatchEventAt = Date.now();
         if (this._watchBootstrapTimer) {
           clearTimeout(this._watchBootstrapTimer);
           this._watchBootstrapTimer = null;
         }
-        this._processMostRecentSessionFile(filePath);
-      });
+        this._debouncedProcessMostRecentSessionFile(filePath);
+      };
 
-      this.watcher.on('add', (filePath) => {
-        if (this._watchBootstrapTimer) {
-          clearTimeout(this._watchBootstrapTimer);
-          this._watchBootstrapTimer = null;
-        }
-        this._processMostRecentSessionFile(filePath);
-      });
+      this.watcher.on('change', onWatchEvent);
+      this.watcher.on('add', onWatchEvent);
 
       this.watcher.on('error', () => {
         if (this.watcher) this.watcher.close();
         this.watcher = null;
+        if (this._sessionPollInterval) {
+          clearInterval(this._sessionPollInterval);
+          this._sessionPollInterval = null;
+        }
         this._startSimulation();
       });
 
@@ -165,8 +168,11 @@ export class PulseMonitor extends EventEmitter {
       // session file even if watcher events are dropped.
       if (!this._sessionPollInterval) {
         this._sessionPollInterval = setInterval(() => {
-          const hasRecent = this._processMostRecentSessionFile();
-          if (!hasRecent) this._startSimulation();
+          void (async () => {
+            if (Date.now() - this._lastWatchEventAt < 5000) return;
+            const hasRecent = await this._processMostRecentSessionFile();
+            if (!hasRecent) this._startSimulation();
+          })();
         }, 1200);
       }
     } catch {
@@ -174,26 +180,32 @@ export class PulseMonitor extends EventEmitter {
     }
   }
 
-  _hasSessionJsonl(dirPath) {
-    try {
-      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = path.join(dirPath, entry.name);
-        if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-          return true;
-        }
-        if (entry.isDirectory() && this._hasSessionJsonl(fullPath)) {
-          return true;
-        }
-      }
-      return false;
-    } catch {
-      return false;
+  _debouncedProcessMostRecentSessionFile(preferredFilePath = null) {
+    if (preferredFilePath) this._pendingPreferredFile = preferredFilePath;
+    if (this._watchDebounceTimer) {
+      clearTimeout(this._watchDebounceTimer);
     }
+    this._watchDebounceTimer = setTimeout(() => {
+      const pathHint = this._pendingPreferredFile;
+      this._pendingPreferredFile = null;
+      this._watchDebounceTimer = null;
+      void this._processMostRecentSessionFile(pathHint);
+    }, 350);
   }
 
-  _listSessionJsonl(dirPath) {
+  _listSessionJsonl(dirPath, visited = new Set(), depth = 0, maxDepth = 24) {
     const files = [];
+    if (depth > maxDepth) return files;
+
+    let realDir;
+    try {
+      realDir = fs.realpathSync(dirPath);
+    } catch {
+      return files;
+    }
+    if (visited.has(realDir)) return files;
+    visited.add(realDir);
+
     try {
       const entries = fs.readdirSync(dirPath, { withFileTypes: true });
       for (const entry of entries) {
@@ -201,34 +213,37 @@ export class PulseMonitor extends EventEmitter {
         if (entry.isFile() && entry.name.endsWith('.jsonl')) {
           files.push(fullPath);
         }
-        if (entry.isDirectory()) {
-          files.push(...this._listSessionJsonl(fullPath));
+        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+          files.push(...this._listSessionJsonl(fullPath, visited, depth + 1, maxDepth));
         }
       }
     } catch {
       return files;
     }
 
-    // Sort newest to oldest so active sessions are processed first.
-    return files.sort((a, b) => {
+    const withMtime = files.map((file) => {
       try {
-        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+        return { file, mtime: fs.statSync(file).mtimeMs };
       } catch {
-        return 0;
+        return null;
       }
-    });
+    }).filter(Boolean);
+
+    // Sort newest to oldest so active sessions are processed first.
+    return withMtime.sort((a, b) => b.mtime - a.mtime).map((entry) => entry.file);
   }
 
-  _isRecentSession(filePath, maxAgeMs = 90000) {
+  async _isRecentSession(filePath, maxAgeMs = 90000) {
     try {
-      const ageMs = Date.now() - fs.statSync(filePath).mtimeMs;
+      const stats = await fs.promises.stat(filePath);
+      const ageMs = Date.now() - stats.mtimeMs;
       return ageMs <= maxAgeMs;
     } catch {
       return false;
     }
   }
 
-  _processMostRecentSessionFile(preferredFilePath = null) {
+  async _processMostRecentSessionFile(preferredFilePath = null) {
     const candidates = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
     if (preferredFilePath && fs.existsSync(preferredFilePath)) {
       candidates.unshift(preferredFilePath);
@@ -237,24 +252,17 @@ export class PulseMonitor extends EventEmitter {
     const unique = [...new Set(candidates)];
     if (unique.length === 0) return false;
 
-    const newest = unique.sort((a, b) => {
-      try {
-        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
-      } catch {
-        return 0;
+    for (const candidate of unique) {
+      if (await this._isRecentSession(candidate)) {
+        return this._processSessionFile(candidate);
       }
-    })[0];
-
-    if (!this._isRecentSession(newest)) {
-      return false;
     }
-
-    return this._processSessionFile(newest);
+    return false;
   }
 
-  _processSessionFile(filePath) {
+  async _processSessionFile(filePath) {
     try {
-      const content = fs.readFileSync(filePath, 'utf8');
+      const content = await fs.promises.readFile(filePath, 'utf8');
       const lines = content.trim().split('\n').filter(Boolean);
       if (lines.length === 0) return false;
 
@@ -264,7 +272,7 @@ export class PulseMonitor extends EventEmitter {
 
       this._analyzeSession(entries, filePath);
       return true;
-    } catch (e) {
+    } catch {
       // File still being written
       return false;
     }
@@ -352,9 +360,6 @@ export class PulseMonitor extends EventEmitter {
     metrics.session.lastTool = lastTool;
 
     // --- Context estimation ---
-    const assistantMessages = entries.filter(e =>
-      e.role === 'assistant' || e.type === 'assistant'
-    );
     const userMessages = entries.filter(e =>
       e.role === 'user' || e.type === 'user'
     );
@@ -497,20 +502,19 @@ export class PulseMonitor extends EventEmitter {
   _pollStats() {
     // Poll Claude stats file for quota data
     this._quotaPollInterval = setInterval(() => {
-      this._readQuotaStats();
+      void this._readQuotaStats();
     }, 5000);
-    this._readQuotaStats();
+    void this._readQuotaStats();
   }
 
-  _readQuotaStats() {
+  async _readQuotaStats() {
     try {
-      if (fs.existsSync(CLAUDE_STATS_FILE)) {
-        const data = JSON.parse(fs.readFileSync(CLAUDE_STATS_FILE, 'utf8'));
-        // Extract quota info if available
-        if (data.quota !== undefined) {
-          this.metrics.quota.remaining = data.quota;
-          this.metrics.quota.used = 100 - data.quota;
-        }
+      const raw = await fs.promises.readFile(CLAUDE_STATS_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      // Extract quota info if available
+      if (data.quota !== undefined) {
+        this.metrics.quota.remaining = data.quota;
+        this.metrics.quota.used = 100 - data.quota;
       }
     } catch {}
 
@@ -538,7 +542,7 @@ export class PulseMonitor extends EventEmitter {
 
       if (this.metrics.quota.burnRate > 0) {
         this.metrics.quota.estimatedHoursLeft =
-          (this.metrics.quota.remaining / this.metrics.quota.burnRate).toFixed(1);
+          Number((this.metrics.quota.remaining / this.metrics.quota.burnRate).toFixed(1));
       }
     }
   }
@@ -585,6 +589,7 @@ export class PulseMonitor extends EventEmitter {
     }
 
     this.emit('simulating');
+    this._budgetEmitted = false;
     let tick = 0;
 
     const simulate = () => {
@@ -620,7 +625,7 @@ export class PulseMonitor extends EventEmitter {
       else if (contextPct > 0.20) contextHealth = 'warming';
 
       const burnRate = 8 + Math.random() * 4;
-      const hoursLeft = (quotaRemaining / burnRate).toFixed(1);
+      const hoursLeft = Number((quotaRemaining / burnRate).toFixed(1));
 
       let status = 'healthy';
       if (thinkingLevel === 'degraded' || loops >= 3 || contextHealth === 'critical') {

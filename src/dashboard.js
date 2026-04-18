@@ -147,7 +147,7 @@ export class TerminalDashboard {
       status: null,
       thinkingLevel: null,
       contextHealth: null,
-      budgetMode: null,
+      budgetMode: false,
       loopAboveThreshold: null,
       loopTriggered: false,
     };
@@ -812,6 +812,7 @@ export class TerminalDashboard {
     });
 
     this.screen.key(['a'], () => {
+      if (this.overlayOpen) return;
       this.overlayOpen = true;
       this.widgets.actionsOverlay.setContent(
         `${chalk.hex(C.accent).bold('RESPONSE ACTIONS')}\n\n${this.responseOverlayText}\n\n${chalk.hex(C.dim)('Press any key to close.')}`,
@@ -823,12 +824,11 @@ export class TerminalDashboard {
         if (!this.overlayOpen) return;
         this.overlayOpen = false;
         this.widgets.actionsOverlay.hide();
-        this.screen.removeListener('keypress', dismiss);
         this._render();
       };
 
       setTimeout(() => {
-        this.screen.on('keypress', dismiss);
+        this.screen.once('keypress', dismiss);
       }, 0);
     });
   }

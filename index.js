@@ -12,5 +12,12 @@ const dashboard = new TerminalDashboard(monitor);
 dashboard.init();
 monitor.start();
 
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+process.on('uncaughtException', (error) => {
+	process.stderr.write(`pulse fatal uncaughtException: ${error?.stack || error}\n`);
+	process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+	process.stderr.write(`pulse fatal unhandledRejection: ${reason?.stack || reason}\n`);
+	process.exit(1);
+});
