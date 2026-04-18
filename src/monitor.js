@@ -292,14 +292,14 @@ export class PulseMonitor extends EventEmitter {
     }
 
     // --- Tool call analysis (Read:Edit ratio) ---
-    const toolCalls = entries.filter(e => e.type === 'tool_use' || e.tool_name);
+    const toolCalls = this._extractToolCalls(entries);
     metrics.session.toolCalls = toolCalls.length;
 
-    const reads = toolCalls.filter(e =>
-      ['read_file', 'view', 'Read'].includes(e.name || e.tool_name)
+    const reads = toolCalls.filter((e) =>
+      ['read_file', 'view', 'Read'].includes(e.name)
     ).length;
-    const edits = toolCalls.filter(e =>
-      ['write_file', 'edit_file', 'str_replace_based_edit_tool', 'Write', 'Edit'].includes(e.name || e.tool_name)
+    const edits = toolCalls.filter((e) =>
+      ['write_file', 'edit_file', 'str_replace_based_edit_tool', 'Write', 'Edit'].includes(e.name)
     ).length;
 
     metrics.session.readEditRatio = edits > 0 ? (reads / edits).toFixed(1) : '∞';
@@ -316,8 +316,8 @@ export class PulseMonitor extends EventEmitter {
     let lastResult = null;
 
     for (const entry of toolCalls) {
-      const tool = entry.name || entry.tool_name;
-      const isError = entry.is_error || entry.error;
+      const tool = entry.name;
+      const isError = entry.isError;
 
       if (tool === lastTool && isError && lastResult === 'error') {
         consecutive++;
@@ -385,6 +385,37 @@ export class PulseMonitor extends EventEmitter {
 
     this._checkBudgetMode();
     this.emit('update', this.metrics);
+  }
+
+  _extractToolCalls(entries) {
+    const calls = [];
+
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+
+      // Legacy/direct shape.
+      if (entry.type === 'tool_use' || entry.tool_name) {
+        calls.push({
+          name: entry.name || entry.tool_name,
+          isError: Boolean(entry.is_error || entry.error),
+        });
+      }
+
+      // Current Claude Code shape: assistant message content blocks.
+      const content = entry.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === 'tool_use' && block?.name) {
+            calls.push({
+              name: block.name,
+              isError: false,
+            });
+          }
+        }
+      }
+    }
+
+    return calls;
   }
 
   _extractVersionFromEntries(entries) {
