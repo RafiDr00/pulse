@@ -113,7 +113,7 @@ function thinkingColor(level) {
 
 function contextColor(health) {
   if (health === 'healthy') return C.green;
-  if (health === 'warming') return C.yellow;
+  if (health === 'warming') return C.cyan;
   if (health === 'compressing') return C.yellow;
   if (health === 'critical') return C.red;
   return C.muted;
@@ -369,6 +369,9 @@ export class TerminalDashboard {
       this._pushEvent(C.red, `⚠ loop detected — ${metrics.session.loops} failures`);
       this._lastEvents.loopTriggered = true;
     }
+    if (!loopAboveThreshold) {
+      this._lastEvents.loopTriggered = false;
+    }
     this._lastEvents.loopAboveThreshold = loopAboveThreshold;
 
     if (this._lastEvents.contextHealth !== null && this._lastEvents.contextHealth !== metrics.context.health) {
@@ -380,8 +383,12 @@ export class TerminalDashboard {
     this._lastEvents.contextHealth = metrics.context.health;
 
     const budgetMode = Boolean(metrics.budgetMode);
-    if (this._lastEvents.budgetMode === false && budgetMode) {
-      this._pushEvent(C.yellow, `budget mode active at ${metrics.quota.remaining}% remaining`);
+    if (this._lastEvents.budgetMode !== null && this._lastEvents.budgetMode !== budgetMode) {
+      if (budgetMode) {
+        this._pushEvent(C.yellow, `budget mode enabled at ${metrics.quota.remaining}% remaining`);
+      } else {
+        this._pushEvent(C.muted, 'budget mode disabled');
+      }
     }
     this._lastEvents.budgetMode = budgetMode;
   }
@@ -433,7 +440,7 @@ export class TerminalDashboard {
     this.widgets.response.height = responseH;
 
     const row2Top = headerH + statusH + row1H + budgetH + responseH;
-    const row2Height = Math.max(8, this.screen.height - row2Top - footerH);
+    const row2Height = Math.max(9, this.screen.height - row2Top - footerH);
 
     this.widgets.session.top = row2Top;
     this.widgets.events.top = row2Top;
@@ -478,7 +485,7 @@ export class TerminalDashboard {
     const icon = STATUS_ICONS[status] || STATUS_ICONS.idle;
     const dot = this.dotBright ? chalk.hex(color)(icon) : chalk.hex(C.dim)(icon);
 
-    const logo = `${chalk.hex(C.accent).bold('pulse')}▸`;
+    const logo = chalk.hex(C.accent).bold('pulse▸');
     const badge = chalk.hex(color).bold(`${dot} ${status.toUpperCase()}`);
     const version = chalk.hex(C.muted)('claude-code');
     const sim = metrics._simulated ? chalk.hex(C.muted)('[SIMULATED]') : '';
@@ -564,12 +571,11 @@ export class TerminalDashboard {
     ];
 
     if (Number(s.editWithoutRead) > 0) {
-      lines.push(chalk.hex(C.red)(`${s.editWithoutRead} edits made without reading file first — this is the specific actionable data that tells the developer exactly which sessions need manual review.`));
+      lines.push(chalk.hex(C.red)(`⚠ edit-without-read: ${s.editWithoutRead}`));
     }
 
     if (t.redacted) {
       lines.push(chalk.hex(C.yellow)('⚠ thinking redacted by Anthropic'));
-      lines.push(chalk.hex(C.yellow)('└ depth estimated via signature correlation'));
     }
 
     this.widgets.thinking.setContent(lines.join('\n'));
@@ -598,7 +604,7 @@ export class TerminalDashboard {
     } else if (c.health === 'compressing') {
       healthMessage = chalk.hex(C.yellow)('◌ context compressing — watch for drift');
     } else if (c.health === 'critical') {
-      healthMessage = chalk.hex(C.red)('⚠ context critical — degradation likely');
+      healthMessage = chalk.hex(C.red)('⚠ context critical — end session now');
     }
 
     const lines = [
@@ -607,7 +613,7 @@ export class TerminalDashboard {
       `${chalk.hex(C.muted)('tokens:')} ${chalk.hex(C.dim)(`${c.used} / ${c.total}`)}`,
       chalk.hex(barColor)(makeBar(c.percent, barWidth)),
       healthMessage,
-      c.health === 'critical' ? chalk.hex(C.redDim)('quality degradation is happening now — this is not a warning') : '',
+      c.health === 'critical' ? chalk.hex(C.red)('quality degradation is happening now — this is not a warning') : '',
     ].filter(Boolean);
 
     this.widgets.context.setContent(lines.join('\n'));
@@ -632,9 +638,9 @@ export class TerminalDashboard {
     const panelWidth = Math.max(10, Number(this.widgets.budget.width) || this.screen.width || 80);
 
     this.widgets.budget.setContent([
-      trimToWidth(first, panelWidth),
-      trimToWidth(second, panelWidth),
-      trimToWidth(third, panelWidth),
+      padAnsiRight(trimToWidth(first, panelWidth), panelWidth),
+      padAnsiRight(trimToWidth(second, panelWidth), panelWidth),
+      padAnsiRight(trimToWidth(third, panelWidth), panelWidth),
     ].join('\n'));
   }
 
@@ -671,15 +677,8 @@ export class TerminalDashboard {
       ]);
     }
 
-    if (isVersionInRange(metrics.version, '2.1.100', '2.1.109') && Number(metrics.quota.burnRate) > 15) {
-      pushLines(5, [
-        chalk.hex(C.yellow).bold('⚠ INVISIBLE TOKEN BUG: your version may be silently adding 20K tokens per request'),
-        chalk.hex('#e2e8f0')('fix: npm install -g @anthropic-ai/claude-code@2.1.98'),
-      ]);
-    }
-
     if (metrics.budgetMode) {
-      pushLines(6, [
+      pushLines(5, [
         chalk.hex(C.yellow).bold('⚡ QUOTA LOW — budget mode active'),
         chalk.hex('#e2e8f0')(`estimated time remaining: ${formatHoursMinutes(metrics.quota.estimatedHoursLeft)} at current burn rate`),
         chalk.hex('#e2e8f0')('action: finish your current task only — do not start anything new'),
@@ -698,28 +697,26 @@ export class TerminalDashboard {
   }
 
   _renderResponsePanel(lines) {
-    const title = chalk.hex(C.accent).bold('RESPONSE');
     const panelWidth = Math.max(10, Number(this.widgets.response.width) || this.screen.width || 80);
-    this.widgets.response.style.border.fg = lines.length === 1 && stripAnsi(lines[0]).includes('no action required')
-      ? C.muted
-      : C.accent;
-    this.widgets.response.setContent([
-      trimToWidth(title, panelWidth),
-      ...lines.map((line) => trimToWidth(line, panelWidth)),
-    ].join('\n'));
+    const nominalOnly = lines.length === 1 && stripAnsi(lines[0]) === '◌ all systems nominal — no action required';
+    this.widgets.response.style.border.fg = nominalOnly ? C.muted : C.accent;
+    this.widgets.response.setContent(
+      lines.map((line) => padAnsiRight(trimToWidth(line, panelWidth), panelWidth)).join('\n'),
+    );
   }
 
   _renderSessionPanel(metrics) {
     const s = metrics.session;
-    const ratio = Number.parseFloat(s.readEditRatio);
-    const ratioColor = Number.isNaN(ratio) ? C.green : ratio >= 5 ? C.green : ratio >= 2 ? C.yellow : C.red;
+    const ratioRaw = String(s.readEditRatio);
+    const ratio = Number.parseFloat(ratioRaw);
+    const ratioFinite = Number.isFinite(ratio);
+    const ratioColor = !ratioFinite || ratio > 5 ? C.green : ratio >= 2 ? C.yellow : C.red;
     const loopColor = s.loops >= 3 ? C.red : C.muted;
-    const ratioWarn = Number.isNaN(ratio) || ratio >= 2 ? '' : ` ${chalk.hex(C.red)('⚠ edit-first')}`;
-    const ratioOk = Number.isNaN(ratio) || ratio < 5 ? '' : ` ${chalk.hex(C.green)('✓')}`;
+    const ratioWarn = !ratioFinite || ratio >= 2 ? '' : ` ${chalk.hex(C.red)('⚠ edit-first')}`;
+    const ratioOk = (!ratioFinite || ratio > 5) ? ` ${chalk.hex(C.green)('✓')}` : '';
     const loopWarn = s.loops >= 3 ? ` ${chalk.hex(C.red).bold('⚠ STUCK')}` : '';
 
     const lines = [
-      chalk.hex(C.accent).bold('SESSION STATS'),
       `${chalk.hex(C.muted)('duration:')} ${chalk.hex(C.green)(formatDuration(s.duration))}`,
       `${chalk.hex(C.muted)('prompts:')} ${chalk.hex(C.green).bold(String(s.prompts))}`,
       `${chalk.hex(C.muted)('tool calls:')} ${chalk.hex(C.green).bold(String(s.toolCalls))}`,
@@ -729,7 +726,8 @@ export class TerminalDashboard {
     ];
 
     this._syncLoopFlash(s.loops);
-    this.widgets.session.setContent(lines.join('\n'));
+    const panelWidth = Math.max(10, Number(this.widgets.session.width) || Math.floor(this.screen.width / 2) || 40);
+    this.widgets.session.setContent(lines.map((line) => padAnsiRight(trimToWidth(line, panelWidth), panelWidth)).join('\n'));
   }
 
   _syncLoopFlash(loops) {
@@ -756,13 +754,13 @@ export class TerminalDashboard {
     const available = Math.max(1, this.widgets.events.height - 2);
     const tail = this.events.slice(-available);
 
-    const lines = [chalk.hex(C.accent).bold('EVENTS')];
+    const lines = [];
     tail.forEach((entry) => {
       const dot = chalk.hex(entry.color)('●');
+      const stamp = String(entry.stamp || '').slice(-8);
       const messageWidth = Math.max(1, panelWidth - 12);
-      const msg = stripAnsi(entry.message).slice(0, messageWidth).padEnd(messageWidth);
-      const text = `${dot} ${msg}`;
-      const line = `${text}${chalk.hex(C.dim)(entry.stamp.padStart(8))}`;
+      const msg = stripAnsi(entry.message).slice(0, messageWidth);
+      const line = padAnsiRight(`${dot} ${msg}  ${chalk.hex(C.dim)(stamp)}`, panelWidth);
       lines.push(line);
     });
 
@@ -785,6 +783,7 @@ export class TerminalDashboard {
       if (this.loopFlashInterval) clearInterval(this.loopFlashInterval);
       this.monitor.stop();
       this.screen.destroy();
+      process.stdout.write('\x1b[0m\x1b[?25h\x1b[2J\x1b[0;0H');
       process.exit(0);
     });
 
@@ -799,7 +798,9 @@ export class TerminalDashboard {
       }
       if (next) {
         const remaining = this.latestMetrics?.quota?.remaining ?? this.monitor.metrics?.quota?.remaining ?? 0;
-        this._pushEvent(C.yellow, `budget mode active at ${remaining}% remaining`);
+        this._pushEvent(C.yellow, `budget mode enabled at ${remaining}% remaining`);
+      } else {
+        this._pushEvent(C.muted, 'budget mode disabled');
       }
       this._lastEvents.budgetMode = next;
       this._render();

@@ -35,6 +35,7 @@ export class PulseMonitor extends EventEmitter {
     this._tokenHistory = []; // [{time, tokens}] for burn rate
     this._watchBootstrapTimer = null;
     this._sessionPollInterval = null;
+    this._quotaPollInterval = null;
   }
 
   _freshMetrics() {
@@ -98,6 +99,10 @@ export class PulseMonitor extends EventEmitter {
       clearInterval(this._sessionPollInterval);
       this._sessionPollInterval = null;
     }
+    if (this._quotaPollInterval) {
+      clearInterval(this._quotaPollInterval);
+      this._quotaPollInterval = null;
+    }
     if (this.watcher) this.watcher.close();
     this.emit('stopped');
   }
@@ -109,14 +114,10 @@ export class PulseMonitor extends EventEmitter {
       return;
     }
 
-    if (!this._hasSessionJsonl(CLAUDE_SESSIONS_DIR)) {
+    // Prefer real sessions only when they are active/recent.
+    if (!this._processMostRecentSessionFile()) {
       this._startSimulation();
-      return;
     }
-
-    // Prime metrics from existing session files so we don't fall back to
-    // simulation while real data is already present on disk.
-    this._processMostRecentSessionFile();
 
     try {
       this.watcher = chokidar.watch(SESSIONS_GLOB, {
@@ -128,11 +129,12 @@ export class PulseMonitor extends EventEmitter {
 
       this._watchBootstrapTimer = setTimeout(() => {
         if (!this.activeSession) {
-          // Only simulate if no real session files currently exist.
-          if (!this._hasSessionJsonl(CLAUDE_SESSIONS_DIR)) {
+          // Simulate when no recent real activity is detected.
+          if (!this._processMostRecentSessionFile()) {
             if (this.watcher) this.watcher.close();
             this.watcher = null;
             this._startSimulation();
+            this._watchSessions();
           }
         }
       }, 1500);
@@ -163,7 +165,8 @@ export class PulseMonitor extends EventEmitter {
       // session file even if watcher events are dropped.
       if (!this._sessionPollInterval) {
         this._sessionPollInterval = setInterval(() => {
-          this._processMostRecentSessionFile();
+          const hasRecent = this._processMostRecentSessionFile();
+          if (!hasRecent) this._startSimulation();
         }, 1200);
       }
     } catch {
@@ -216,6 +219,15 @@ export class PulseMonitor extends EventEmitter {
     });
   }
 
+  _isRecentSession(filePath, maxAgeMs = 90000) {
+    try {
+      const ageMs = Date.now() - fs.statSync(filePath).mtimeMs;
+      return ageMs <= maxAgeMs;
+    } catch {
+      return false;
+    }
+  }
+
   _processMostRecentSessionFile(preferredFilePath = null) {
     const candidates = this._listSessionJsonl(CLAUDE_SESSIONS_DIR);
     if (preferredFilePath && fs.existsSync(preferredFilePath)) {
@@ -223,7 +235,7 @@ export class PulseMonitor extends EventEmitter {
     }
 
     const unique = [...new Set(candidates)];
-    if (unique.length === 0) return;
+    if (unique.length === 0) return false;
 
     const newest = unique.sort((a, b) => {
       try {
@@ -233,22 +245,28 @@ export class PulseMonitor extends EventEmitter {
       }
     })[0];
 
-    this._processSessionFile(newest);
+    if (!this._isRecentSession(newest)) {
+      return false;
+    }
+
+    return this._processSessionFile(newest);
   }
 
   _processSessionFile(filePath) {
     try {
       const content = fs.readFileSync(filePath, 'utf8');
       const lines = content.trim().split('\n').filter(Boolean);
-      if (lines.length === 0) return;
+      if (lines.length === 0) return false;
 
       const entries = lines.map(l => {
         try { return JSON.parse(l); } catch { return null; }
       }).filter(Boolean);
 
       this._analyzeSession(entries, filePath);
+      return true;
     } catch (e) {
       // File still being written
+      return false;
     }
   }
 
@@ -380,6 +398,13 @@ export class PulseMonitor extends EventEmitter {
     else metrics.status = 'warning';
 
     metrics.lastUpdated = Date.now();
+    metrics._simulated = false;
+
+    if (this._simInterval) {
+      clearInterval(this._simInterval);
+      this._simInterval = null;
+    }
+
     this.metrics = { ...this.metrics, ...metrics };
     this.activeSession = filePath;
 
@@ -471,7 +496,7 @@ export class PulseMonitor extends EventEmitter {
 
   _pollStats() {
     // Poll Claude stats file for quota data
-    setInterval(() => {
+    this._quotaPollInterval = setInterval(() => {
       this._readQuotaStats();
     }, 5000);
     this._readQuotaStats();
