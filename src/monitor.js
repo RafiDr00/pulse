@@ -4,7 +4,6 @@ import os from 'os';
 import { EventEmitter } from 'events';
 
 const CLAUDE_SESSIONS_DIR = path.join(os.homedir(), '.claude', 'projects');
-const CLAUDE_STATS_FILE = path.join(os.homedir(), '.claude', 'statsig.json');
 const REAL_SESSION_FORCE_RECENT_MS = 10 * 60 * 1000;
 const REAL_SESSION_GRACE_MS = 30 * 60 * 1000;
 const SUBAGENTS_SEGMENT = `${path.sep}subagents${path.sep}`;
@@ -19,7 +18,6 @@ const THRESHOLDS = {
   QUOTA_BUDGET_TRIGGER: 0.25,// 25% remaining → auto budget mode
   QUOTA_WARN: 0.40,          // 40% remaining → warning
   LOOP_THRESHOLD: 3,         // consecutive same-tool failures = loop
-  BURN_SAMPLE_WINDOW: 300,   // 5 minutes for burn rate calc
 };
 
 export class PulseMonitor extends EventEmitter {
@@ -31,10 +29,8 @@ export class PulseMonitor extends EventEmitter {
     this.history = [];
     this.watcher = null;
     this.budgetMode = false;
-    this._tokenHistory = []; // [{time, tokens}] for burn rate
     this._watchBootstrapTimer = null;
     this._sessionPollInterval = null;
-    this._quotaPollInterval = null;
     this._simInterval = null;
     this._budgetEmitted = false;
     this._watchDebounceTimer = null;
@@ -89,7 +85,6 @@ export class PulseMonitor extends EventEmitter {
 
   start() {
     this._watchSessions();
-    this._pollStats();
     this.emit('started');
   }
 
@@ -105,10 +100,6 @@ export class PulseMonitor extends EventEmitter {
     if (this._sessionPollInterval) {
       clearInterval(this._sessionPollInterval);
       this._sessionPollInterval = null;
-    }
-    if (this._quotaPollInterval) {
-      clearInterval(this._quotaPollInterval);
-      this._quotaPollInterval = null;
     }
     if (this._watchDebounceTimer) {
       clearTimeout(this._watchDebounceTimer);
@@ -454,6 +445,14 @@ export class PulseMonitor extends EventEmitter {
     metrics.context.total = hasMillionContext ? 1000000 : 200000;
     metrics.context.percent = metrics.context.used / metrics.context.total;
 
+    // Honest quota estimate from current context footprint (no disk quota source exists).
+    const quotaUsedEstimate = Math.max(0, Math.min(100, Math.round(metrics.context.percent * 100)));
+    metrics.quota.total = 100;
+    metrics.quota.used = quotaUsedEstimate;
+    metrics.quota.remaining = 100 - quotaUsedEstimate;
+    metrics.quota.burnRate = null;
+    metrics.quota.estimatedHoursLeft = null;
+
     // Context health (per AMD data: degradation starts at 20-40%)
     if (metrics.context.percent < 0.20) {
       metrics.context.health = 'healthy';
@@ -620,79 +619,15 @@ export class PulseMonitor extends EventEmitter {
 
     // Requested behavior: use first entry timestamp field when present.
     const first = entries[0];
-    const firstMs = parseMs(first?.timestamp ?? first?.ts ?? first?.created_at);
+    const firstMs = parseMs(first?.timestamp ?? first?.ts ?? first?.createdAt ?? first?.created_at);
     if (firstMs) return firstMs;
 
     // Fallback for sessions where the first entry has no timestamp metadata.
     for (const entry of entries) {
-      const ms = parseMs(entry?.timestamp ?? entry?.ts ?? entry?.created_at);
+      const ms = parseMs(entry?.timestamp ?? entry?.ts ?? entry?.createdAt ?? entry?.created_at);
       if (ms) return ms;
     }
     return null;
-  }
-
-  _pollStats() {
-    // Poll Claude stats file for quota data
-    this._quotaPollInterval = setInterval(() => {
-      void this._readQuotaStats();
-    }, 5000);
-    void this._readQuotaStats();
-  }
-
-  async _readQuotaStats() {
-    try {
-      const raw = await fs.promises.readFile(CLAUDE_STATS_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      // Extract quota info if available
-      if (Number.isFinite(data.quota)) {
-        this.metrics.quota.total = 100;
-        this.metrics.quota.remaining = data.quota;
-        this.metrics.quota.used = 100 - data.quota;
-      }
-    } catch {
-      this.metrics.quota.total = null;
-      this.metrics.quota.remaining = null;
-      this.metrics.quota.used = null;
-      this.metrics.quota.burnRate = null;
-      this.metrics.quota.estimatedHoursLeft = null;
-      this._tokenHistory = [];
-    }
-
-    this._updateBurnRate();
-    this.emit('update', this.metrics);
-  }
-
-  _updateBurnRate() {
-    if (!Number.isFinite(this.metrics.quota.used)) {
-      this.metrics.quota.burnRate = null;
-      this.metrics.quota.estimatedHoursLeft = null;
-      return;
-    }
-
-    const now = Date.now();
-    this._tokenHistory.push({ time: now, used: this.metrics.quota.used });
-
-    // Keep last 5 min
-    this._tokenHistory = this._tokenHistory.filter(
-      e => now - e.time < THRESHOLDS.BURN_SAMPLE_WINDOW * 1000
-    );
-
-    if (this._tokenHistory.length >= 2) {
-      const oldest = this._tokenHistory[0];
-      const newest = this._tokenHistory[this._tokenHistory.length - 1];
-      const deltaUsed = newest.used - oldest.used;
-      const deltaTime = (newest.time - oldest.time) / 3600000; // hours
-      this.metrics.quota.burnRate = deltaTime > 0
-        ? Math.round(deltaUsed / deltaTime)
-        : null;
-
-      if (Number.isFinite(this.metrics.quota.burnRate) && this.metrics.quota.burnRate > 0 && Number.isFinite(this.metrics.quota.remaining)) {
-        this.metrics.quota.estimatedHoursLeft =
-          Number((this.metrics.quota.remaining / this.metrics.quota.burnRate).toFixed(1));
-      } else {
-        this.metrics.quota.estimatedHoursLeft = null;
-      }
-    }
   }
 
   _checkBudgetMode() {

@@ -507,8 +507,8 @@ export class TerminalDashboard {
     const quotaKnown = Number.isFinite(metrics.quota.used) && Number.isFinite(metrics.quota.remaining);
     const quotaUsedPct = quotaKnown ? clamp(metrics.quota.used, 0, 100) : 0;
     const quotaColor = quotaKnown ? quotaColorFromConsumption(quotaUsedPct) : C.muted;
-    const quotaRemainingText = quotaKnown ? `${metrics.quota.remaining}%` : '--';
-    const quotaUsedText = quotaKnown ? `used ${quotaUsedPct}%` : 'used --';
+    const quotaEstimateText = quotaKnown ? `~${quotaUsedPct}%` : '--';
+    const quotaUsedText = quotaKnown ? `est. used ~${quotaUsedPct}%` : 'used --';
 
     const burnKnown = Number.isFinite(metrics.quota.burnRate);
     const burnColor = burnKnown ? burnRateColor(metrics.quota.burnRate) : C.muted;
@@ -542,7 +542,7 @@ export class TerminalDashboard {
 
     this.widgets.status3.setContent([
       trimToWidth(chalk.hex(C.muted).bold('QUOTA'), w3),
-      trimToWidth(chalk.hex(quotaColor).bold(quotaRemainingText), w3),
+      trimToWidth(chalk.hex(quotaColor).bold(quotaEstimateText), w3),
       trimToWidth(chalk.hex(quotaColor)(makeBar(quotaUsedPct / 100, barW3)), w3),
       trimToWidth(chalk.hex(C.dim)(quotaUsedText), w3),
     ].join('\n'));
