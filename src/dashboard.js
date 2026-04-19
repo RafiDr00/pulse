@@ -504,11 +504,17 @@ export class TerminalDashboard {
     const contextValueColor = contextColor(metrics.context.health);
     const contextBarColor = quotaColorFromConsumption(contextPct);
 
-    const quotaUsedPct = clamp(metrics.quota.used, 0, 100);
-    const quotaColor = quotaColorFromConsumption(quotaUsedPct);
+    const quotaKnown = Number.isFinite(metrics.quota.used) && Number.isFinite(metrics.quota.remaining);
+    const quotaUsedPct = quotaKnown ? clamp(metrics.quota.used, 0, 100) : 0;
+    const quotaColor = quotaKnown ? quotaColorFromConsumption(quotaUsedPct) : C.muted;
+    const quotaRemainingText = quotaKnown ? `${metrics.quota.remaining}%` : '--';
+    const quotaUsedText = quotaKnown ? `used ${quotaUsedPct}%` : 'used --';
 
-    const burnColor = burnRateColor(metrics.quota.burnRate);
-    const burnPct = clamp(metrics.quota.burnRate / 30, 0, 1);
+    const burnKnown = Number.isFinite(metrics.quota.burnRate);
+    const burnColor = burnKnown ? burnRateColor(metrics.quota.burnRate) : C.muted;
+    const burnPct = burnKnown ? clamp(metrics.quota.burnRate / 30, 0, 1) : 0;
+    const burnRateText = burnKnown ? `${metrics.quota.burnRate}%/h` : '--';
+    const hoursLeftText = Number.isFinite(metrics.quota.estimatedHoursLeft) ? `${metrics.quota.estimatedHoursLeft}h left` : '--';
 
     const w1 = Math.max(10, Number(this.widgets.status1.width) || 20);
     const w2 = Math.max(10, Number(this.widgets.status2.width) || 20);
@@ -536,16 +542,16 @@ export class TerminalDashboard {
 
     this.widgets.status3.setContent([
       trimToWidth(chalk.hex(C.muted).bold('QUOTA'), w3),
-      trimToWidth(chalk.hex(quotaColor).bold(`${metrics.quota.remaining}%`), w3),
+      trimToWidth(chalk.hex(quotaColor).bold(quotaRemainingText), w3),
       trimToWidth(chalk.hex(quotaColor)(makeBar(quotaUsedPct / 100, barW3)), w3),
-      trimToWidth(chalk.hex(C.dim)(`used ${quotaUsedPct}%`), w3),
+      trimToWidth(chalk.hex(C.dim)(quotaUsedText), w3),
     ].join('\n'));
 
     this.widgets.status4.setContent([
       trimToWidth(chalk.hex(C.muted).bold('BURN RATE'), w4),
-      trimToWidth(chalk.hex(burnColor).bold(`${metrics.quota.burnRate}%/h`), w4),
+      trimToWidth(chalk.hex(burnColor).bold(burnRateText), w4),
       trimToWidth(chalk.hex(burnColor)(makeBar(burnPct, barW4)), w4),
-      trimToWidth(chalk.hex(C.dim)(`${metrics.quota.estimatedHoursLeft || '--'}h left`), w4),
+      trimToWidth(chalk.hex(C.dim)(hoursLeftText), w4),
     ].join('\n'));
   }
 

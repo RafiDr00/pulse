@@ -64,10 +64,10 @@ export class PulseMonitor extends EventEmitter {
         compressions: 0,
       },
       quota: {
-        used: 0,
-        total: 100,             // percentage based
-        remaining: 100,
-        burnRate: 0,            // % per hour
+        used: null,
+        total: null,            // percentage based
+        remaining: null,
+        burnRate: null,         // % per hour
         estimatedHoursLeft: null,
         sessionStart: Date.now(),
       },
@@ -335,34 +335,36 @@ export class PulseMonitor extends EventEmitter {
     metrics.status = 'healthy';
     metrics.version = this._extractVersionFromEntries(entries) || this.metrics.version || null;
     metrics.quota = { ...this.metrics.quota };
-    const birthMs = fileStats?.birthtimeMs || this._activeSessionBirthMs || Date.now();
+    const firstEntryTimestamp = this._extractFirstEntryTimestamp(entries);
+    const birthMs = firstEntryTimestamp || fileStats?.birthtimeMs || this._activeSessionBirthMs || Date.now();
     metrics.session.duration = Math.max(0, Math.floor((Date.now() - birthMs) / 1000));
 
     // --- Thinking depth analysis ---
     const thinkingBlocks = [];
     for (const entry of entries) {
       if (!entry || typeof entry !== 'object') continue;
-      if (entry.type === 'thinking' || entry.thinking_content || entry.signature || entry.thinking) {
+      if (entry.type === 'thinking' && (entry.thinking || entry.signature)) {
         thinkingBlocks.push(entry);
       }
       const blocks = entry.message?.content;
       if (Array.isArray(blocks)) {
         for (const block of blocks) {
-          if (block?.type === 'thinking' || block?.thinking || block?.thinking_content || block?.signature) {
+          // Real observed shape: { type: 'thinking', thinking, signature }
+          if (block?.type === 'thinking' && (block?.thinking || block?.signature)) {
             thinkingBlocks.push(block);
           }
         }
       }
     }
 
-    const visibleThinking = thinkingBlocks.filter(e => (e.thinking_content || e.thinking));
-    const redactedThinking = thinkingBlocks.filter(e => e.signature && !(e.thinking_content || e.thinking));
+    const visibleThinking = thinkingBlocks.filter(e => typeof e.thinking === 'string' && e.thinking.length > 0);
+    const redactedThinking = thinkingBlocks.filter(e => e.signature && !(typeof e.thinking === 'string' && e.thinking.length > 0));
 
     metrics.thinking.redacted = redactedThinking.length > visibleThinking.length;
 
     if (visibleThinking.length > 0) {
       const avgLen = visibleThinking.reduce((s, e) =>
-        s + ((e.thinking_content || e.thinking || '').length || 0), 0) / visibleThinking.length;
+        s + (e.thinking?.length || 0), 0) / visibleThinking.length;
       metrics.thinking.depth = Math.round(avgLen);
     } else if (redactedThinking.length > 0) {
       // Estimate from signature correlation (0.971 Pearson per AMD analysis)
@@ -602,6 +604,33 @@ export class PulseMonitor extends EventEmitter {
     return null;
   }
 
+  _extractFirstEntryTimestamp(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+
+    const parseMs = (value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return value > 1e12 ? value : value * 1000;
+      }
+      if (typeof value === 'string') {
+        const ms = Date.parse(value);
+        return Number.isFinite(ms) ? ms : null;
+      }
+      return null;
+    };
+
+    // Requested behavior: use first entry timestamp field when present.
+    const first = entries[0];
+    const firstMs = parseMs(first?.timestamp ?? first?.ts ?? first?.created_at);
+    if (firstMs) return firstMs;
+
+    // Fallback for sessions where the first entry has no timestamp metadata.
+    for (const entry of entries) {
+      const ms = parseMs(entry?.timestamp ?? entry?.ts ?? entry?.created_at);
+      if (ms) return ms;
+    }
+    return null;
+  }
+
   _pollStats() {
     // Poll Claude stats file for quota data
     this._quotaPollInterval = setInterval(() => {
@@ -615,17 +644,31 @@ export class PulseMonitor extends EventEmitter {
       const raw = await fs.promises.readFile(CLAUDE_STATS_FILE, 'utf8');
       const data = JSON.parse(raw);
       // Extract quota info if available
-      if (data.quota !== undefined) {
+      if (Number.isFinite(data.quota)) {
+        this.metrics.quota.total = 100;
         this.metrics.quota.remaining = data.quota;
         this.metrics.quota.used = 100 - data.quota;
       }
-    } catch {}
+    } catch {
+      this.metrics.quota.total = null;
+      this.metrics.quota.remaining = null;
+      this.metrics.quota.used = null;
+      this.metrics.quota.burnRate = null;
+      this.metrics.quota.estimatedHoursLeft = null;
+      this._tokenHistory = [];
+    }
 
     this._updateBurnRate();
     this.emit('update', this.metrics);
   }
 
   _updateBurnRate() {
+    if (!Number.isFinite(this.metrics.quota.used)) {
+      this.metrics.quota.burnRate = null;
+      this.metrics.quota.estimatedHoursLeft = null;
+      return;
+    }
+
     const now = Date.now();
     this._tokenHistory.push({ time: now, used: this.metrics.quota.used });
 
@@ -641,16 +684,24 @@ export class PulseMonitor extends EventEmitter {
       const deltaTime = (newest.time - oldest.time) / 3600000; // hours
       this.metrics.quota.burnRate = deltaTime > 0
         ? Math.round(deltaUsed / deltaTime)
-        : 0;
+        : null;
 
-      if (this.metrics.quota.burnRate > 0) {
+      if (Number.isFinite(this.metrics.quota.burnRate) && this.metrics.quota.burnRate > 0 && Number.isFinite(this.metrics.quota.remaining)) {
         this.metrics.quota.estimatedHoursLeft =
           Number((this.metrics.quota.remaining / this.metrics.quota.burnRate).toFixed(1));
+      } else {
+        this.metrics.quota.estimatedHoursLeft = null;
       }
     }
   }
 
   _checkBudgetMode() {
+    if (!Number.isFinite(this.metrics.quota.remaining)) {
+      this.budgetMode = false;
+      this.metrics.budgetMode = false;
+      return;
+    }
+
     const remainingPct = this.metrics.quota.remaining / 100;
     if (!this.budgetMode && remainingPct <= THRESHOLDS.QUOTA_BUDGET_TRIGGER) {
       this.budgetMode = true;
